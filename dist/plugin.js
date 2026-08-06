@@ -6559,7 +6559,7 @@ async function handleSetTodoColsCommand(ctx, dependencies) {
 		const cols = Number(raw);
 		const current = await resolveTodoCols();
 		if (!/^\d+$/u.test(raw) || !Number.isInteger(cols) || cols < 1 || cols > TODO_MAX_COLS) {
-			await ctx.reply(`❌ 無效欄數：請使用 \`/settodo-cols <1-${TODO_MAX_COLS}>\`（目前 ${current} 欄）`);
+			await ctx.reply(`❌ 無效欄數：請使用 \`/settodo_cols <1-${TODO_MAX_COLS}>\`（目前 ${current} 欄）`);
 			return;
 		}
 		await setTodoCols(cols);
@@ -6570,7 +6570,7 @@ async function handleSetTodoColsCommand(ctx, dependencies) {
 	}
 }
 function registerSetTodoColsCommand(bot, dependencies) {
-	bot.command("settodo-cols", async (ctx) => {
+	bot.command("settodo_cols", async (ctx) => {
 		await handleSetTodoColsCommand(ctx, scopeDependenciesToTelegramContext(dependencies, ctx, "telegram"));
 	});
 }
@@ -6578,7 +6578,7 @@ var SETTODO_COLS_COMMAND_DEFINITION = {
 	describe() {
 		return "Set the number of columns per row for todo buttons";
 	},
-	names: ["settodo-cols"],
+	names: ["settodo_cols"],
 	register: registerSetTodoColsCommand
 };
 async function handleTodoCallback(ctx, dependencies) {
