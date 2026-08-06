@@ -6457,45 +6457,13 @@ function buildTodoMessage(state) {
 			lines.push("（無）");
 			continue;
 		}
-		lines.push(...formatTodoItemsGrid(items));
+		for (let index = 0; index < items.length; index += 1) {
+			const item = items[index];
+			lines.push(`${index + 1}. ${item.checked ? "✅" : "⬜"} ${item.text}`);
+		}
 	}
 	lines.push("", "點下方按鈕切換事項狀態");
 	return lines.join("\n");
-}
-function formatTodoItemsGrid(items, columnCount = 2) {
-	const lines = [];
-	if (items.length === 0) return lines;
-	const rendered = items.map((item, index) => `${index + 1}. ${item.checked ? "✅" : "⬜"} ${item.text}`);
-	const columnWidths = [];
-	for (let column = 0; column < columnCount; column += 1) {
-		let width = 0;
-		for (let index = column; index < rendered.length; index += columnCount) {
-			width = Math.max(width, todoDisplayWidth(rendered[index]));
-		}
-		columnWidths.push(width);
-	}
-	for (let index = 0; index < rendered.length; index += columnCount) {
-		const cells = [];
-		for (let column = 0; column < columnCount; column += 1) {
-			const itemIndex = index + column;
-			if (itemIndex >= rendered.length) break;
-			cells.push(todoPadWidth(rendered[itemIndex], columnWidths[column]));
-		}
-		lines.push(`\`${cells.join("   ").trimEnd()}\``);
-	}
-	return lines;
-}
-function todoDisplayWidth(value) {
-	let width = 0;
-	for (const char of value) width += isTodoWideCharacter(char.codePointAt(0) ?? 0) ? 2 : 1;
-	return width;
-}
-function isTodoWideCharacter(codePoint) {
-	return codePoint >= 4352 && (codePoint <= 4447 || codePoint === 9001 || codePoint === 9002 || codePoint >= 11904 && codePoint <= 42191 && codePoint !== 12351 || codePoint >= 44032 && codePoint <= 55203 || codePoint >= 63744 && codePoint <= 64255 || codePoint >= 65040 && codePoint <= 65049 || codePoint >= 65072 && codePoint <= 65135 || codePoint >= 65280 && codePoint <= 65376 || codePoint >= 65504 && codePoint <= 65510);
-}
-function todoPadWidth(value, targetWidth) {
-	const padding = Math.max(0, targetWidth - todoDisplayWidth(value));
-	return `${value}${" ".repeat(padding)}`;
 }
 function truncateTodoButtonText(text, maxBytes) {
 	const bytes = new TextEncoder().encode(text).length;
