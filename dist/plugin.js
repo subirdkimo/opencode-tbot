@@ -6481,21 +6481,48 @@ function truncateTodoButtonText(text, maxBytes) {
 async function buildTodoKeyboard(state) {
 	const cols = await resolveTodoCols();
 	const keyboard = new InlineKeyboard();
+	let targetWidth = 0;
+	const pending = [];
 	for (const list of TODO_LIST_ORDER) {
 		const items = state[list].items;
 		if (items.length === 0) continue;
-		keyboard.text(`${TODO_LIST_LABELS[list]}`, `todo:list:${list}`);
-		keyboard.row();
-		for (let index = 0; index < items.length; index += 1) {
-			const item = items[index];
+		const sectionButtons = items.map((item, index) => {
 			const target = TODO_NEXT_STEP[list];
 			const mark = item.checked ? "✅" : "⬜";
-			keyboard.text(`${mark} ${truncateTodoButtonText(item.text, 40)}`, `todo:move:${list}:${index}:${target}`);
-			if ((index + 1) % cols === 0 || index === items.length - 1) keyboard.row();
+			return {
+				label: `${mark} ${truncateTodoButtonText(item.text, 40)}`,
+				data: `todo:move:${list}:${index}:${target}`
+			};
+		});
+		targetWidth = Math.max(targetWidth, todoLabelWidth(TODO_LIST_LABELS[list]), ...sectionButtons.map((button) => todoLabelWidth(button.label)));
+		pending.push({ list, sectionButtons });
+	}
+	targetWidth = Math.min(targetWidth, 44);
+	for (const { list, sectionButtons } of pending) {
+		keyboard.text(alignTodoButtonText(TODO_LIST_LABELS[list], targetWidth), `todo:list:${list}`);
+		keyboard.row();
+		for (let index = 0; index < sectionButtons.length; index += 1) {
+			const button = sectionButtons[index];
+			keyboard.text(alignTodoButtonText(button.label, targetWidth), button.data);
+			if ((index + 1) % cols === 0 || index === sectionButtons.length - 1) keyboard.row();
 		}
 	}
-	keyboard.text("🔄 重新整理", "todo:refresh");
+	keyboard.text(alignTodoButtonText("🔄 重新整理", targetWidth), "todo:refresh");
 	return keyboard;
+}
+var TODO_ZWJ = "\u200d";
+function alignTodoButtonText(text, targetWidth) {
+	const padding = Math.max(0, targetWidth - todoLabelWidth(text));
+	if (padding === 0) return text;
+	return `${text}${" \u200d".repeat(padding)}`;
+}
+function todoLabelWidth(value) {
+	let width = 0;
+	for (const char of value) width += isTodoWideCharacter(char.codePointAt(0) ?? 0) ? 2 : 1;
+	return width;
+}
+function isTodoWideCharacter(codePoint) {
+	return codePoint >= 4352 && (codePoint <= 4447 || codePoint === 9001 || codePoint === 9002 || codePoint >= 11904 && codePoint <= 42191 && codePoint !== 12351 || codePoint >= 44032 && codePoint <= 55203 || codePoint >= 63744 && codePoint <= 64255 || codePoint >= 65040 && codePoint <= 65049 || codePoint >= 65072 && codePoint <= 65135 || codePoint >= 65280 && codePoint <= 65376 || codePoint >= 65504 && codePoint <= 65510);
 }
 async function handleTodoCommand(ctx, dependencies) {
 	const copy = await getSafeChatCopy(dependencies.sessionRepo, ctx.chat.id, dependencies.logger);
