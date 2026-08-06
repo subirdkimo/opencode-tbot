@@ -6505,8 +6505,8 @@ function buildTodoKeyboard(state) {
 			const target = TODO_NEXT_STEP[list];
 			const mark = item.checked ? "✅" : "⬜";
 			keyboard.text(`${mark} ${truncateTodoButtonText(item.text, 40)}`, `todo:move:${list}:${index}:${target}`);
+			if (index % 2 === 1 || index === items.length - 1) keyboard.row();
 		}
-		keyboard.row();
 	}
 	keyboard.text("🔄 重新整理", "todo:refresh");
 	return keyboard;
