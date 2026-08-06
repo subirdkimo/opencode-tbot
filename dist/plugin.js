@@ -5384,7 +5384,8 @@ function getTelegramCommandDefinitions() {
 		MODELS_COMMAND_DEFINITION,
 		TOKEN_COMMAND_DEFINITION,
 		LANGUAGE_COMMAND_DEFINITION,
-		TODO_COMMAND_DEFINITION
+		TODO_COMMAND_DEFINITION,
+		SETTODO_COLS_COMMAND_DEFINITION
 	];
 }
 function registerTelegramCommands(bot, dependencies) {
@@ -6378,6 +6379,8 @@ var TODO_STEP_BUTTON = {
 	"done": "↩"
 };
 var TODO_DEFAULT_DIRECTORY = "/root/opencode/todo";
+var TODO_DEFAULT_COLS = 1;
+var TODO_MAX_COLS = 10;
 var TODO_MOVE_PREFIX = "todo:move:";
 var TODO_TEXT_PATTERN = /^(show|display|list|get|view|see|print|open|顯示|列出|查看|檢視|看)?(?:\s*(me|my|the|我的|目前|我)){0,2}\s*(todo|todolist|todo\s*list|待辦|待办|待辦清單|待办清单|工作清單|工作清单)\s*(list|清單)?\s*[.!?]?\s*$/i;
 var TODO_ITEM_PATTERN = /^\s*[-*]\s+\[([ xX])\]\s+(.+?)\s*$/u;
@@ -6389,6 +6392,20 @@ async function resolveTodoDirectory() {
 		if (typeof configured === "string" && configured.trim().length > 0) return configured.trim();
 	} catch {}
 	return TODO_DEFAULT_DIRECTORY;
+}
+async function resolveTodoCols() {
+	try {
+		const configFile = await loadPluginConfigFile(getGlobalPluginConfigFilePath());
+		const configured = configFile?.todo?.cols;
+		if (typeof configured === "number" && Number.isInteger(configured) && configured >= 1 && configured <= TODO_MAX_COLS) return configured;
+	} catch {}
+	return TODO_DEFAULT_COLS;
+}
+async function setTodoCols(cols) {
+	const configFilePath = getGlobalPluginConfigFilePath();
+	const currentConfig = await loadPluginConfigFile(configFilePath);
+	const nextConfig = mergePluginConfigSources(currentConfig, { todo: { ...(currentConfig.todo && typeof currentConfig.todo === "object" ? currentConfig.todo : {}), cols } });
+	await writePluginConfigFile(configFilePath, nextConfig);
 }
 async function readTodoFiles(directory) {
 	const state = {};
@@ -6493,7 +6510,8 @@ function truncateTodoButtonText(text, maxBytes) {
 	}
 	return `${out}…`;
 }
-function buildTodoKeyboard(state) {
+async function buildTodoKeyboard(state) {
+	const cols = await resolveTodoCols();
 	const keyboard = new InlineKeyboard();
 	for (const list of TODO_LIST_ORDER) {
 		const items = state[list].items;
@@ -6505,7 +6523,7 @@ function buildTodoKeyboard(state) {
 			const target = TODO_NEXT_STEP[list];
 			const mark = item.checked ? "✅" : "⬜";
 			keyboard.text(`${mark} ${truncateTodoButtonText(item.text, 40)}`, `todo:move:${list}:${index}:${target}`);
-			if (index % 2 === 1 || index === items.length - 1) keyboard.row();
+			if ((index + 1) % cols === 0 || index === items.length - 1) keyboard.row();
 		}
 	}
 	keyboard.text("🔄 重新整理", "todo:refresh");
@@ -6516,7 +6534,7 @@ async function handleTodoCommand(ctx, dependencies) {
 	try {
 		const directory = await resolveTodoDirectory();
 		const state = await readTodoFiles(directory);
-		await ctx.reply(buildTodoMessage(state), { reply_markup: buildTodoKeyboard(state) });
+		await ctx.reply(buildTodoMessage(state), { reply_markup: await buildTodoKeyboard(state) });
 	} catch (error) {
 		dependencies.logger.error({ error }, "failed to show todo list");
 		await ctx.reply(presentError(error, copy));
@@ -6534,6 +6552,35 @@ var TODO_COMMAND_DEFINITION = {
 	names: ["todo"],
 	register: registerTodoCommand
 };
+async function handleSetTodoColsCommand(ctx, dependencies) {
+	const copy = await getSafeChatCopy(dependencies.sessionRepo, ctx.chat.id, dependencies.logger);
+	try {
+		const raw = String(ctx.match ?? "").trim();
+		const cols = Number(raw);
+		const current = await resolveTodoCols();
+		if (!/^\d+$/u.test(raw) || !Number.isInteger(cols) || cols < 1 || cols > TODO_MAX_COLS) {
+			await ctx.reply(`❌ 無效欄數：請使用 \`/settodo-cols <1-${TODO_MAX_COLS}>\`（目前 ${current} 欄）`);
+			return;
+		}
+		await setTodoCols(cols);
+		await ctx.reply(`✅ 已將待辦按鈕欄數設為 ${cols} 欄`);
+	} catch (error) {
+		dependencies.logger.error({ error }, "failed to set todo cols");
+		await ctx.reply(presentError(error, copy));
+	}
+}
+function registerSetTodoColsCommand(bot, dependencies) {
+	bot.command("settodo-cols", async (ctx) => {
+		await handleSetTodoColsCommand(ctx, scopeDependenciesToTelegramContext(dependencies, ctx, "telegram"));
+	});
+}
+var SETTODO_COLS_COMMAND_DEFINITION = {
+	describe() {
+		return "Set the number of columns per row for todo buttons";
+	},
+	names: ["settodo-cols"],
+	register: registerSetTodoColsCommand
+};
 async function handleTodoCallback(ctx, dependencies) {
 	const data = ctx.callbackQuery.data;
 	if (!data.startsWith("todo:")) return;
@@ -6544,7 +6591,7 @@ async function handleTodoCallback(ctx, dependencies) {
 		const directory = await resolveTodoDirectory();
 		if (data === "todo:refresh") {
 			const state = await readTodoFiles(directory);
-			await ctx.editMessageText(buildTodoMessage(state), { reply_markup: buildTodoKeyboard(state) });
+			await ctx.editMessageText(buildTodoMessage(state), { reply_markup: await buildTodoKeyboard(state) });
 			return;
 		}
 		if (data.startsWith(TODO_MOVE_PREFIX)) {
@@ -6554,7 +6601,7 @@ async function handleTodoCallback(ctx, dependencies) {
 			if (!TODO_LIST_ORDER.includes(from) || !TODO_LIST_ORDER.includes(to) || !/^\d+$/u.test(index)) return;
 			await moveTodoItem(directory, from, Number(index), to);
 			const state = await readTodoFiles(directory);
-			await ctx.editMessageText(buildTodoMessage(state), { reply_markup: buildTodoKeyboard(state) });
+			await ctx.editMessageText(buildTodoMessage(state), { reply_markup: await buildTodoKeyboard(state) });
 			return;
 		}
 	} catch (error) {
