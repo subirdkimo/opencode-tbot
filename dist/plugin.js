@@ -1,7 +1,7 @@
 import { a as mergePluginConfigSources, d as loadAppConfig, f as calculateDisplayedTokenTotal, i as loadPluginConfigFile, l as OPENCODE_TBOT_VERSION, m as getGlobalPluginConfigFilePath, o as preparePluginConfiguration, r as validateTelegramBotAccessWithBot, s as writePluginConfigFile, t as TelegramStartupError } from "./assets/telegram-bot-access-DKhF1Ko4.js";
 import { appendFile, mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
-import { Bot, GrammyError, HttpError, InlineKeyboard } from "grammy";
+import { Bot, GrammyError, HttpError, InlineKeyboard, InputFile } from "grammy";
 import { randomUUID } from "node:crypto";
 import { createOpencodeClient } from "@opencode-ai/sdk";
 import { run } from "@grammyjs/runner";
@@ -5372,6 +5372,84 @@ var TOKEN_COMMAND_DEFINITION = {
 	register: registerTokenCommand
 };
 //#endregion
+//#region src/bot/image
+var IMAGE_TOOL_DIR = "/root/image-gen-tools";
+var IMAGE_TOOL_PY = IMAGE_TOOL_DIR + "/.venv/bin/python";
+var IMAGE_TOOL_SCRIPT = IMAGE_TOOL_DIR + "/bing_gen.py";
+function parseImageFlags(raw) {
+	const flags = { count: 1, model: "dall-e-3", aspect: "square", pptx: false };
+	const tokens = raw.split(/\s+/);
+	const promptParts = [];
+	for (let i = 0; i < tokens.length; i++) {
+		const t = tokens[i];
+		if (t === "--pptx") {
+			flags.pptx = true;
+			continue;
+		}
+		if ((t === "--count" || t === "--model" || t === "--aspect") && i + 1 < tokens.length) {
+			const val = tokens[++i];
+			if (t === "--count" && /^\d+$/.test(val)) flags.count = Math.min(4, Math.max(1, Number(val)));
+			else if (t === "--model" && ["dall-e-3", "gpt-4o", "mai-1"].includes(val)) flags.model = val;
+			else if (t === "--aspect" && ["square", "landscape", "portrait"].includes(val)) flags.aspect = val;
+			continue;
+		}
+		promptParts.push(t);
+	}
+	return { prompt: promptParts.join(" ").trim(), flags };
+}
+async function registerImageCommand(bot, dependencies) {
+	bot.command("image", async (ctx) => {
+		const raw = String(ctx.match ?? "").trim();
+		const { prompt, flags } = parseImageFlags(raw);
+		if (!prompt) {
+			await ctx.reply("用法：/image <描述> [--count N] [--model dall-e-3|gpt-4o|mai-1] [--aspect square|landscape|portrait] [--pptx]\n\n範例：/image 一張日落山谷 --count 2 --pptx");
+			return;
+		}
+		const args = [IMAGE_TOOL_SCRIPT, "generate", "--count", String(flags.count), "--model", flags.model, "--aspect", flags.aspect];
+		if (flags.pptx) args.push("--pptx");
+		args.push(prompt);
+		try {
+			const { execFile } = await import("node:child_process");
+			const execFileAsync = (file, argv, opts) => new Promise((resolve, reject) => {
+				execFile(file, argv, opts, (err, stdout, stderr) => err ? reject(Object.assign(err, { stderr })) : resolve({ stdout }));
+			});
+			const { stdout } = await execFileAsync(IMAGE_TOOL_PY, args, { cwd: IMAGE_TOOL_DIR, timeout: 300000 });
+			const res = JSON.parse(stdout);
+			const allFiles = [...(res.files ?? []), ...(res.pptx_files ?? [])];
+			let photoSent = false;
+			if (allFiles.length) {
+				try {
+					const media = allFiles.slice(0, 10).map((f) => ({ type: "photo", media: new InputFile(f) }));
+					media[0].caption = `${res.prompt}\n模型: ${res.model} / ${res.aspect}${flags.pptx ? " (+16:9 pptx)" : ""}`;
+					await ctx.replyWithMediaGroup(media);
+					photoSent = true;
+				} catch (e) {
+					photoSent = false;
+				}
+			}
+			const lines = [`已生成 ${res.count} 張（${res.model}/${res.aspect}，${res.latency}s）`, ""];
+			if (photoSent) lines.push("圖片已傳至上方相簿。");
+			lines.push("", "檔案:");
+			for (const f of allFiles) lines.push(`- ${f}`);
+			await ctx.reply(lines.join("\n"));
+		} catch (err) {
+			const stderr = err?.stderr || err?.message || String(err);
+			if (/cookie|AuthCookieError|auth_failed/i.test(stderr)) {
+				await ctx.reply("❌ Bing cookie 已失效或達生成限制。請重新登入 https://www.bing.com/images/create 抓取新 cookies 更新 config.json（約每 2-4 週需更新）。");
+			} else {
+				await ctx.reply(`❌ 圖片生成失敗：${stderr}`);
+			}
+		}
+	});
+}
+var IMAGE_COMMAND_DEFINITION = {
+	describe() {
+		return "Generate AI images (Bing Image Creator)";
+	},
+	names: ["image"],
+	register: registerImageCommand
+};
+//#endregion
 //#region src/bot/commands/registry.ts
 function getTelegramCommandDefinitions() {
 	return [
@@ -5385,7 +5463,8 @@ function getTelegramCommandDefinitions() {
 		TOKEN_COMMAND_DEFINITION,
 		LANGUAGE_COMMAND_DEFINITION,
 		TODO_COMMAND_DEFINITION,
-		SETTODO_COLS_COMMAND_DEFINITION
+		SETTODO_COLS_COMMAND_DEFINITION,
+		IMAGE_COMMAND_DEFINITION
 	];
 }
 function registerTelegramCommands(bot, dependencies) {
