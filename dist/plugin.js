@@ -6544,6 +6544,24 @@ function buildTodoMessage(state) {
 	lines.push("", "點下方按鈕切換事項狀態");
 	return lines.join("\n");
 }
+function buildTodoMessageActive(state) {
+	const lines = ["📋 待辦清單"];
+	for (const list of ["in-progress", "backlog"]) {
+		const items = state[list].items;
+		lines.push("", `— ${TODO_LIST_LABELS[list]} —`);
+		if (items.length === 0) {
+			lines.push("（無）");
+			continue;
+		}
+		for (let index = 0; index < items.length; index += 1) {
+			const item = items[index];
+			lines.push(`${index + 1}. ${item.checked ? "✅" : "⬜"} ${item.text}`);
+		}
+	}
+	lines.push("", "✅ 已完成項目請用 /todo_done 查看");
+	lines.push("", "點下方按鈕切換事項狀態");
+	return lines.join("\n");
+}
 function truncateTodoButtonText(text, maxBytes) {
 	const bytes = new TextEncoder().encode(text).length;
 	if (bytes <= maxBytes) return text;
@@ -6589,6 +6607,27 @@ async function buildTodoKeyboard(state) {
 	keyboard.text(alignTodoButtonText("🔄 重新整理", targetWidth), "todo:refresh");
 	return keyboard;
 }
+async function buildTodoDoneKeyboard(state) {
+	const cols = await resolveTodoCols();
+	const keyboard = new InlineKeyboard();
+	const doneItems = state["done"].items;
+	if (doneItems.length === 0) {
+		keyboard.text("（無）", "");
+	} else {
+		let targetWidth = 0;
+		for (const item of doneItems) {
+			targetWidth = Math.max(targetWidth, todoLabelWidth(item.text));
+		}
+		targetWidth = Math.min(targetWidth, 44);
+		for (const item of doneItems) {
+			keyboard.text(alignTodoButtonText(item.text, targetWidth), `todo:done:${item.index}`);
+			keyboard.row();
+		}
+	}
+	keyboard.text(alignTodoButtonText("⬅️ 返回 /todo", targetWidth), "todo:back2main");
+	keyboard.text(alignTodoButtonText("🔄 重新整理", targetWidth), "todo:refresh");
+	return keyboard;
+}
 var TODO_ZWJ = "\u200d";
 function alignTodoButtonText(text, targetWidth) {
 	const padding = Math.max(0, targetWidth - todoLabelWidth(text));
@@ -6608,15 +6647,31 @@ async function handleTodoCommand(ctx, dependencies) {
 	try {
 		const directory = await resolveTodoDirectory();
 		const state = await readTodoFiles(directory);
-		await ctx.reply(buildTodoMessage(state), { reply_markup: await buildTodoKeyboard(state) });
+		await ctx.reply(buildTodoMessageActive(state), { reply_markup: await buildTodoKeyboard(state) });
 	} catch (error) {
 		dependencies.logger.error({ error }, "failed to show todo list");
+		await ctx.reply(presentError(error, copy));
+	}
+}
+async function handleTodoDoneCommand(ctx, dependencies) {
+	const copy = await getSafeChatCopy(dependencies.sessionRepo, ctx.chat.id, dependencies.logger);
+	try {
+		const directory = await resolveTodoDirectory();
+		const state = await readTodoFiles(directory);
+		await ctx.reply(buildTodoMessage(state), { reply_markup: await buildTodoDoneKeyboard(state) });
+	} catch (error) {
+		dependencies.logger.error({ error }, "failed to show done list");
 		await ctx.reply(presentError(error, copy));
 	}
 }
 function registerTodoCommand(bot, dependencies) {
 	bot.command("todo", async (ctx) => {
 		await handleTodoCommand(ctx, scopeDependenciesToTelegramContext(dependencies, ctx, "telegram"));
+	});
+}
+function registerTodoDoneCommand(bot, dependencies) {
+	bot.command("todo_done", async (ctx) => {
+		await handleTodoDoneCommand(ctx, scopeDependenciesToTelegramContext(dependencies, ctx, "telegram"));
 	});
 }
 var TODO_COMMAND_DEFINITION = {
@@ -6663,9 +6718,13 @@ async function handleTodoCallback(ctx, dependencies) {
 	const copy = await getSafeChatCopy(dependencies.sessionRepo, ctx.chat.id, dependencies.logger);
 	try {
 		const directory = await resolveTodoDirectory();
+		const state = await readTodoFiles(directory);
 		if (data === "todo:refresh") {
-			const state = await readTodoFiles(directory);
 			await ctx.editMessageText(buildTodoMessage(state), { reply_markup: await buildTodoKeyboard(state) });
+			return;
+		}
+		if (data === "todo:back2main") {
+			await ctx.editMessageText(buildTodoMessageActive(state), { reply_markup: await buildTodoKeyboard(state) });
 			return;
 		}
 		if (data.startsWith(TODO_MOVE_PREFIX)) {
@@ -6674,8 +6733,11 @@ async function handleTodoCallback(ctx, dependencies) {
 			const [from, index, to] = parts;
 			if (!TODO_LIST_ORDER.includes(from) || !TODO_LIST_ORDER.includes(to) || !/^\d+$/u.test(index)) return;
 			await moveTodoItem(directory, from, Number(index), to);
-			const state = await readTodoFiles(directory);
 			await ctx.editMessageText(buildTodoMessage(state), { reply_markup: await buildTodoKeyboard(state) });
+			return;
+		}
+		if (data === "todo:done") {
+			await ctx.editMessageText(buildTodoMessage(state), { reply_markup: await buildTodoDoneKeyboard(state) });
 			return;
 		}
 	} catch (error) {
