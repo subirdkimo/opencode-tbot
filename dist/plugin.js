@@ -6720,7 +6720,7 @@ async function handleTodoCallback(ctx, dependencies) {
 		const directory = await resolveTodoDirectory();
 		const state = await readTodoFiles(directory);
 		if (data === "todo:refresh") {
-			await ctx.editMessageText(buildTodoMessageActive(state), { reply_markup: await buildTodoKeyboard(state) });
+			await ctx.editMessageText(buildTodoMessage(state), { reply_markup: await buildTodoKeyboard(state) });
 			return;
 		}
 		if (data === "todo:back2main") {
@@ -6733,7 +6733,7 @@ async function handleTodoCallback(ctx, dependencies) {
 			const [from, index, to] = parts;
 			if (!TODO_LIST_ORDER.includes(from) || !TODO_LIST_ORDER.includes(to) || !/^\d+$/u.test(index)) return;
 			await moveTodoItem(directory, from, Number(index), to);
-			await ctx.editMessageText(buildTodoMessageActive(state), { reply_markup: await buildTodoKeyboard(state) });
+			await ctx.editMessageText(buildTodoMessage(state), { reply_markup: await buildTodoKeyboard(state) });
 			return;
 		}
 		if (data === "todo:done") {
@@ -6750,7 +6750,78 @@ function registerTodoCallbackRoute(bot, dependencies) {
 		await handleTodoCallback(ctx, scopeDependenciesToTelegramContext(dependencies, ctx, "telegram"));
 	});
 }
-//#endregion  [opencode-tbot:todo] END
+//#region [opencode-tbot:mailsearch] START
+async function handleMailSearchCommand(ctx, dependencies) {
+	const copy = await getSafeChatCopy(dependencies.sessionRepo, ctx.chat.id, dependencies.logger);
+	const args = (ctx.match ?? "").trim();
+	
+	try {
+		const { spawnSync } = await import("node:child_process");
+		const scriptPath = "/root/.config/opencode/mail-agent/mail_search.py";
+		const cmdArgs = ["python3", scriptPath];
+		
+		if (args) {
+			cmdArgs.push(...args.split(/\s+/));
+		} else {
+			cmdArgs.push("--limit", "20");
+		}
+		
+		const result = spawnSync(cmdArgs[0], cmdArgs.slice(1), {
+			encoding: "utf-8",
+			timeout: 30000,
+		});
+		
+		if (result.error) {
+			await ctx.reply(`❌ 搜尋失敗: ${result.error.message}`);
+			return;
+		}
+		
+		const output = (result.stdout || "").trim();
+		const stderr = (result.stderr || "").trim();
+		
+		if (!output && !stderr) {
+			await ctx.reply("📭 沒有找到符合的郵件處理記錄。");
+			return;
+		}
+		
+		if (stderr) {
+			await ctx.reply(`⚠️ 警告: ${stderr}`);
+		}
+		
+		// Split long output into multiple messages (Telegram limit ~4096 chars)
+		const maxLen = 4000;
+		if (output.length <= maxLen) {
+			await ctx.reply(`🔍 郵件搜尋結果:\n\n${output}`);
+		} else {
+			const chunks = [];
+			for (let i = 0; i < output.length; i += maxLen) {
+				chunks.push(output.slice(i, i + maxLen));
+			}
+			for (let i = 0; i < chunks.length; i++) {
+				const prefix = i === 0 ? "🔍 郵件搜尋結果" : `🔍 (續 ${i + 1}/${chunks.length})`;
+				await ctx.reply(`${prefix}:\n\n${chunks[i]}`);
+			}
+		}
+	} catch (error) {
+		dependencies.logger.error({ error }, "failed to execute mail search");
+		await ctx.reply(presentError(error, copy));
+	}
+}
+
+function registerMailSearchCommand(bot, dependencies) {
+	bot.command("mailsearch", async (ctx) => {
+		await handleMailSearchCommand(ctx, scopeDependenciesToTelegramContext(dependencies, ctx, "telegram"));
+	});
+}
+
+var MAILSEARCH_COMMAND_DEFINITION = {
+	describe() {
+		return "Search mail processing history (usage: /mailsearch [sender] [--since YYYY-MM-DD] [--action TYPE] [keyword...])";
+	},
+	names: ["mailsearch"],
+	register: registerMailSearchCommand
+};
+//#endregion [opencode-tbot:mailsearch] END
 export { TelegramBotPlugin, TelegramBotPlugin as default, ensureTelegramBotPluginRuntime, resetTelegramBotPluginRuntimeForTests };
 
 //# sourceMappingURL=plugin.js.map
