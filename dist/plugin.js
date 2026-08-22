@@ -5463,6 +5463,7 @@ function getTelegramCommandDefinitions() {
 		TOKEN_COMMAND_DEFINITION,
 		LANGUAGE_COMMAND_DEFINITION,
 		TODO_COMMAND_DEFINITION,
+		TODO_DONE_COMMAND_DEFINITION,
 		SETTODO_COLS_COMMAND_DEFINITION,
 		IMAGE_COMMAND_DEFINITION
 	];
@@ -6529,6 +6530,7 @@ async function moveTodoItem(directory, from, index, to) {
 }
 function buildTodoMessage(state) {
 	const lines = ["📋 待辦清單"];
+	const MAX_LENGTH = 4000;
 	for (const list of TODO_LIST_ORDER) {
 		const items = state[list].items;
 		lines.push("", `— ${TODO_LIST_LABELS[list]} —`);
@@ -6539,6 +6541,12 @@ function buildTodoMessage(state) {
 		for (let index = 0; index < items.length; index += 1) {
 			const item = items[index];
 			lines.push(`${index + 1}. ${item.checked ? "✅" : "⬜"} ${item.text}`);
+			const current = lines.join("\n");
+			if (current.length > MAX_LENGTH) {
+				lines.pop();
+				lines.push(`... (截斷，共 ${items.length} 項，請用 /todo_done 查看完整完成項目)`);
+				return lines.join("\n");
+			}
 		}
 	}
 	lines.push("", "點下方按鈕切換事項狀態");
@@ -6611,19 +6619,26 @@ async function buildTodoDoneKeyboard(state) {
 	const cols = await resolveTodoCols();
 	const keyboard = new InlineKeyboard();
 	const doneItems = state["done"].items;
+	const MAX_DONE_BUTTONS = 20;
+	let targetWidth = 0;
 	if (doneItems.length === 0) {
-		keyboard.text("（無）", "");
+		keyboard.text("（無）", "noop");
 	} else {
-		let targetWidth = 0;
 		for (const item of doneItems) {
 			targetWidth = Math.max(targetWidth, todoLabelWidth(item.text));
 		}
 		targetWidth = Math.min(targetWidth, 44);
-		for (const item of doneItems) {
+		for (let i = 0; i < Math.min(doneItems.length, MAX_DONE_BUTTONS); i++) {
+			const item = doneItems[i];
 			keyboard.text(alignTodoButtonText(item.text, targetWidth), `todo:done:${item.index}`);
 			keyboard.row();
 		}
+		if (doneItems.length > MAX_DONE_BUTTONS) {
+			keyboard.text(`... 共 ${doneItems.length} 項 (顯示前 ${MAX_DONE_BUTTONS} 項)`, "noop");
+			keyboard.row();
+		}
 	}
+	if (targetWidth === 0) targetWidth = 10;
 	keyboard.text(alignTodoButtonText("⬅️ 返回 /todo", targetWidth), "todo:back2main");
 	keyboard.text(alignTodoButtonText("🔄 重新整理", targetWidth), "todo:refresh");
 	return keyboard;
@@ -6658,9 +6673,13 @@ async function handleTodoDoneCommand(ctx, dependencies) {
 	try {
 		const directory = await resolveTodoDirectory();
 		const state = await readTodoFiles(directory);
-		await ctx.reply(buildTodoMessage(state), { reply_markup: await buildTodoDoneKeyboard(state) });
+		const msg = buildTodoMessage(state);
+		const kb = await buildTodoDoneKeyboard(state);
+		dependencies.logger.info({ msgLen: msg.length, kbType: typeof kb }, "todo_done: sending reply");
+		await ctx.reply(msg, { reply_markup: kb });
+		dependencies.logger.info("todo_done: reply sent");
 	} catch (error) {
-		dependencies.logger.error({ error }, "failed to show done list");
+		dependencies.logger.error({ error, stack: error?.stack }, "failed to show done list");
 		await ctx.reply(presentError(error, copy));
 	}
 }
@@ -6674,6 +6693,13 @@ function registerTodoDoneCommand(bot, dependencies) {
 		await handleTodoDoneCommand(ctx, scopeDependenciesToTelegramContext(dependencies, ctx, "telegram"));
 	});
 }
+var TODO_DONE_COMMAND_DEFINITION = {
+	describe() {
+		return "Show completed todo items";
+	},
+	names: ["todo_done"],
+	register: registerTodoDoneCommand
+};
 var TODO_COMMAND_DEFINITION = {
 	describe() {
 		return "Show and manage the todo list";
@@ -6710,6 +6736,16 @@ var SETTODO_COLS_COMMAND_DEFINITION = {
 	names: ["settodo_cols"],
 	register: registerSetTodoColsCommand
 };
+async function safeEditMessageText(ctx, text, options) {
+	try {
+		await ctx.editMessageText(text, options);
+	} catch (error) {
+		if (error?.description?.includes("message is not modified")) {
+			return;
+		}
+		throw error;
+	}
+}
 async function handleTodoCallback(ctx, dependencies) {
 	const data = ctx.callbackQuery.data;
 	if (!data.startsWith("todo:")) return;
@@ -6720,11 +6756,11 @@ async function handleTodoCallback(ctx, dependencies) {
 		const directory = await resolveTodoDirectory();
 		const state = await readTodoFiles(directory);
 		if (data === "todo:refresh") {
-			await ctx.editMessageText(buildTodoMessage(state), { reply_markup: await buildTodoKeyboard(state) });
+			await safeEditMessageText(ctx, buildTodoMessage(state), { reply_markup: await buildTodoKeyboard(state) });
 			return;
 		}
 		if (data === "todo:back2main") {
-			await ctx.editMessageText(buildTodoMessageActive(state), { reply_markup: await buildTodoKeyboard(state) });
+			await safeEditMessageText(ctx, buildTodoMessageActive(state), { reply_markup: await buildTodoKeyboard(state) });
 			return;
 		}
 		if (data.startsWith(TODO_MOVE_PREFIX)) {
@@ -6733,11 +6769,11 @@ async function handleTodoCallback(ctx, dependencies) {
 			const [from, index, to] = parts;
 			if (!TODO_LIST_ORDER.includes(from) || !TODO_LIST_ORDER.includes(to) || !/^\d+$/u.test(index)) return;
 			await moveTodoItem(directory, from, Number(index), to);
-			await ctx.editMessageText(buildTodoMessage(state), { reply_markup: await buildTodoKeyboard(state) });
+			await safeEditMessageText(ctx, buildTodoMessage(state), { reply_markup: await buildTodoKeyboard(state) });
 			return;
 		}
 		if (data === "todo:done") {
-			await ctx.editMessageText(buildTodoMessage(state), { reply_markup: await buildTodoDoneKeyboard(state) });
+			await safeEditMessageText(ctx, buildTodoMessage(state), { reply_markup: await buildTodoDoneKeyboard(state) });
 			return;
 		}
 	} catch (error) {
