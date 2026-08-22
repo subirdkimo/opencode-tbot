@@ -3714,7 +3714,9 @@ function buildPermissionApprovalMessage(request, copy = BOT_COPY) {
 	};
 }
 function buildPermissionApprovalResolvedMessage(requestId, reply, copy = BOT_COPY) {
-	return copy.permission.resolved(requestId, copy.permission.replyLabels[reply]);
+	const base = copy.permission.resolved(requestId, copy.permission.replyLabels[reply]);
+	const when = new Date().toISOString().slice(11, 19);
+	return `${base}\n• ${when}Z`;
 }
 function buildPermissionApprovalKeyboard(requestId, copy = BOT_COPY) {
 	return { inline_keyboard: [[
@@ -3812,11 +3814,12 @@ async function handlePermissionReplied(runtime, event) {
 			const copy = await getSafeChatCopy(runtime.container.sessionRepo, approval.chatId, logger);
 			await runtime.bot.api.editMessageText(approval.chatId, approval.messageId, buildPermissionApprovalResolvedMessage(event.requestId, event.reply, copy));
 		} catch (error) {
-			logger.warn({
-				error,
-				chatId: approval.chatId,
-				event: "plugin-event.permission.reply_message_failed"
-			}, "failed to update Telegram permission message");
+			const isNotModified = error?.error_code === 400 && /message is not modified/i.test(error?.description ?? error?.message ?? "");
+			if (isNotModified) {
+				logger.debug({ chatId: approval.chatId, requestId: event.requestId }, "telegram permission.replied editMessageText no-op (message not modified)");
+				return;
+			}
+			logger.warn({ error, chatId: approval.chatId, event: "plugin-event.permission.reply_message_failed" }, "failed to update Telegram permission message");
 		}
 		await runtime.container.permissionApprovalRepo.set(toResolvedApproval(approval, event.reply));
 	}));
@@ -5778,11 +5781,13 @@ async function handlePermissionApprovalCallback(ctx, dependencies) {
 		});
 		await ctx.editMessageText(buildPermissionApprovalResolvedMessage(parsed.requestId, parsed.reply, copy));
 	} catch (error) {
-		dependencies.logger.error({
-			error,
-			requestId: parsed.requestId
-		}, "failed to reply to permission request");
-		await ctx.editMessageText(copy.permission.replyFailed);
+		const isNotModified = error?.error_code === 400 && /message is not modified/i.test(error?.description ?? error?.message ?? "");
+		if (isNotModified) {
+			dependencies.logger.debug({ requestId: parsed.requestId }, "telegram permission editMessageText no-op (message not modified)");
+			return;
+		}
+		dependencies.logger.error({ error, requestId: parsed.requestId }, "failed to reply to permission request");
+		await ctx.editMessageText(copy.permission.replyFailed).catch(() => {});
 	}
 }
 function registerPermissionApprovalCallbackRoute(bot, dependencies) {
