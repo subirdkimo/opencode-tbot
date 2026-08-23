@@ -514,8 +514,12 @@ var FilePendingActionRepository = class {
 };
 //#endregion
 //#region src/repositories/permission-approval.repo.ts
+var PERMISSION_TTL_MS = 60 * 60 * 1000;
 function buildApprovalKey(requestId, chatId) {
 	return `${requestId}:${chatId}`;
+}
+function isExpired(approval) {
+	return approval.expiresAt && Date.now() > approval.expiresAt;
 }
 var FilePermissionApprovalRepository = class {
 	constructor(store) {
@@ -523,11 +527,11 @@ var FilePermissionApprovalRepository = class {
 	}
 	async listByRequestId(requestId) {
 		const state = await this.store.read();
-		return Object.values(state.pendingPermissions).filter((approval) => approval.requestId === requestId);
+		return Object.values(state.pendingPermissions).filter((approval) => approval.requestId === requestId && !isExpired(approval));
 	}
 	async listByChatId(chatId, options = {}) {
 		const state = await this.store.read();
-		const all = Object.values(state.pendingPermissions).filter((approval) => String(approval.chatId) === String(chatId));
+		const all = Object.values(state.pendingPermissions).filter((approval) => String(approval.chatId) === String(chatId) && !isExpired(approval));
 		const status = options?.status;
 		if (status === undefined || status === null) return all;
 		return all.filter((approval) => approval.status === status);
@@ -536,6 +540,19 @@ var FilePermissionApprovalRepository = class {
 		await this.store.update((state) => {
 			state.pendingPermissions[buildApprovalKey(approval.requestId, approval.chatId)] = approval;
 		});
+	}
+	async cleanupExpired() {
+		const state = await this.store.read();
+		let changed = false;
+		for (const key of Object.keys(state.pendingPermissions)) {
+			if (isExpired(state.pendingPermissions[key])) {
+				delete state.pendingPermissions[key];
+				changed = true;
+			}
+		}
+		if (changed) {
+			await this.store.write(state);
+		}
 	}
 };
 //#endregion
@@ -877,13 +894,28 @@ var OpenCodeClient = class {
 		return this.callSdkOptionsOnlyMethod(this.client.app.agents.bind(this.client.app));
 	}
 	async replyToPermission(sessionId, requestId, reply) {
-		return this.callSdkMethod(this.client.postSessionIdPermissionsPermissionId.bind(this.client), {
-			path: {
-				id: sessionId,
-				permissionID: requestId
-			},
-			body: { response: reply }
-		});
+		try {
+			await this.callSdkMethod(this.client.postSessionIdPermissionsPermissionId.bind(this.client), {
+				path: {
+					id: sessionId,
+					permissionID: requestId
+				},
+				body: { response: reply }
+			});
+			return { success: true };
+		} catch (error) {
+			const message = String(error?.message ?? error ?? "").toLowerCase();
+			if (message.includes("already") || message.includes("resolved") || message.includes("completed")) {
+				return { success: false, reason: "already_resolved", error };
+			}
+			if (message.includes("not found") || message.includes("404")) {
+				return { success: false, reason: "not_found", error };
+			}
+			if (message.includes("session") && (message.includes("closed") || message.includes("ended") || message.includes("not found"))) {
+				return { success: false, reason: "session_closed", error };
+			}
+			return { success: false, reason: "network", error };
+		}
 	}
 	async listModels() {
 		const now = Date.now();
@@ -2759,6 +2791,16 @@ function createAppContainer(config, client) {
 function createContainer(config, opencodeClient, logger) {
 	const storageLogger = logger.child({ component: "storage" });
 	const repositories = createContainerRepositories(config);
+	
+	const cleanupInterval = setInterval(async () => {
+		try {
+			await repositories.permissionApprovalRepo.cleanupExpired();
+		} catch (error) {
+			logger.warn({ error }, "permission approval cleanup failed");
+		}
+	}, 10 * 60 * 1000);
+	cleanupInterval.unref();
+	
 	const runtimeServices = createContainerRuntimeServices(config);
 	const useCases = createContainerUseCases({
 		...repositories,
@@ -2776,6 +2818,7 @@ function createContainer(config, opencodeClient, logger) {
 		async dispose() {
 			if (disposed) return;
 			disposed = true;
+			clearInterval(cleanupInterval);
 			storageLogger.info({
 				event: "storage.container.disposed",
 				filePath: config.stateFilePath
@@ -3888,6 +3931,7 @@ async function handlePermissionAsked(runtime, request) {
 				status: "pending",
 				permission: request.permission,
 				patterns: Array.isArray(request.patterns) ? request.patterns : [],
+				expiresAt: Date.now() + PERMISSION_TTL_MS,
 				updatedAt: (/* @__PURE__ */ new Date()).toISOString()
 			});
 		} catch (error) {
@@ -3919,6 +3963,17 @@ async function handlePermissionReplied(runtime, event) {
 			if (isNotModified) {
 				logger.debug({ chatId: approval.chatId, requestId: event.requestId }, "telegram permission.replied editMessageText no-op (message not modified)");
 				return;
+			}
+			const isMessageTooOld = error?.error_code === 400 && /message (too old|can't be edited)/i.test(error?.description ?? error?.message ?? "");
+			if (isMessageTooOld) {
+				try {
+					const copy = await getSafeChatCopy(runtime.container.sessionRepo, approval.chatId, logger);
+					await runtime.bot.api.sendMessage(approval.chatId, buildPermissionApprovalResolvedMessage(event.requestId, event.reply, copy, origin));
+					logger.info({ chatId: approval.chatId, requestId: event.requestId }, "permission.replied fallback to sendMessage (message too old to edit)");
+					return;
+				} catch (fallbackError) {
+					logger.error({ error: fallbackError, chatId: approval.chatId, requestId: event.requestId }, "permission.replied fallback sendMessage also failed");
+				}
 			}
 			logger.warn({ error, chatId: approval.chatId, event: "plugin-event.permission.reply_message_failed" }, "failed to update Telegram permission message");
 		}
@@ -5923,10 +5978,30 @@ async function handlePermissionApprovalCallback(ctx, dependencies) {
 			await ctx.editMessageText(copy.permission.replyFailed);
 			return;
 		}
+		if (approval.expiresAt && Date.now() > approval.expiresAt) {
+			await ctx.editMessageText("⏱ Permission request expired (1 hour) — please ask again");
+			return;
+		}
 		PERMISSION_REPLY_CHANNEL.set(parsed.requestId, "telegram");
-		if (!await dependencies.opencodeClient.replyToPermission(approval.sessionId, parsed.requestId, parsed.reply)) {
+		const replyResult = await dependencies.opencodeClient.replyToPermission(approval.sessionId, parsed.requestId, parsed.reply);
+		if (!replyResult.success) {
 			PERMISSION_REPLY_CHANNEL.delete(parsed.requestId);
-			await ctx.editMessageText(copy.permission.replyFailed);
+			let errorText = copy.permission.replyFailed;
+			switch (replyResult.reason) {
+				case "already_resolved":
+					errorText = "✅ Already handled by another user";
+					break;
+				case "not_found":
+					errorText = "❌ Permission request not found (may have been cancelled)";
+					break;
+				case "session_closed":
+					errorText = "❌ Session no longer active";
+					break;
+				case "network":
+					errorText = "⚠️ Failed to reach opencode — try again";
+					break;
+			}
+			await ctx.editMessageText(errorText);
 			return;
 		}
 		await dependencies.permissionApprovalRepo.set({
@@ -5940,6 +6015,13 @@ async function handlePermissionApprovalCallback(ctx, dependencies) {
 		if (isNotModified) {
 			dependencies.logger.debug({ requestId: parsed.requestId }, "telegram permission editMessageText no-op (message not modified)");
 			return;
+		}
+		const isMessageTooOld = error?.error_code === 400 && /message (too old|can't be edited)/i.test(error?.description ?? error?.message ?? "");
+		if (isMessageTooOld) {
+			try {
+				await ctx.reply(buildPermissionApprovalResolvedMessage(parsed.requestId, parsed.reply, copy, "telegram"));
+				return;
+			} catch {}
 		}
 		dependencies.logger.error({ error, requestId: parsed.requestId }, "failed to reply to permission request");
 		await ctx.editMessageText(copy.permission.replyFailed).catch(() => {});
