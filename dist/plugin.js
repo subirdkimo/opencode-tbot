@@ -6748,7 +6748,7 @@ async function buildTodoKeyboard(state) {
 	const keyboard = new InlineKeyboard();
 	let targetWidth = 0;
 	const pending = [];
-	for (const list of TODO_LIST_ORDER) {
+	for (const list of ["in-progress", "backlog"]) {
 		const items = state[list].items;
 		if (items.length === 0) continue;
 		const sectionButtons = items.map((item, index) => {
@@ -6916,7 +6916,7 @@ async function handleTodoCallback(ctx, dependencies) {
 		const directory = await resolveTodoDirectory();
 		const state = await readTodoFiles(directory);
 		if (data === "todo:refresh") {
-			await safeEditMessageText(ctx, buildTodoMessage(state), { reply_markup: await buildTodoKeyboard(state) });
+			await safeEditMessageText(ctx, buildTodoMessageActive(state), { reply_markup: await buildTodoKeyboard(state) });
 			return;
 		}
 		if (data === "todo:back2main") {
@@ -6929,7 +6929,7 @@ async function handleTodoCallback(ctx, dependencies) {
 			const [from, index, to] = parts;
 			if (!TODO_LIST_ORDER.includes(from) || !TODO_LIST_ORDER.includes(to) || !/^\d+$/u.test(index)) return;
 			await moveTodoItem(directory, from, Number(index), to);
-			await safeEditMessageText(ctx, buildTodoMessage(state), { reply_markup: await buildTodoKeyboard(state) });
+			await safeEditMessageText(ctx, buildTodoMessageActive(state), { reply_markup: await buildTodoKeyboard(state) });
 			return;
 		}
 		if (data === "todo:done") {
