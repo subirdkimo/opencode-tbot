@@ -525,6 +525,13 @@ var FilePermissionApprovalRepository = class {
 		const state = await this.store.read();
 		return Object.values(state.pendingPermissions).filter((approval) => approval.requestId === requestId);
 	}
+	async listByChatId(chatId, options = {}) {
+		const state = await this.store.read();
+		const all = Object.values(state.pendingPermissions).filter((approval) => String(approval.chatId) === String(chatId));
+		const status = options?.status;
+		if (status === undefined || status === null) return all;
+		return all.filter((approval) => approval.status === status);
+	}
 	async set(approval) {
 		await this.store.update((state) => {
 			state.pendingPermissions[buildApprovalKey(approval.requestId, approval.chatId)] = approval;
@@ -2864,7 +2871,8 @@ var EN_BOT_COPY = {
 		cancel: "Cancel rename or abort running request",
 		model: "Show and switch models",
 		token: "Show or hide token breakdown details",
-		language: "Show and switch language"
+		language: "Show and switch language",
+		permissions: "List pending permission requests"
 	},
 	start: { lines: [
 		"# Welcome to opencode-tbot",
@@ -2934,7 +2942,16 @@ var EN_BOT_COPY = {
 		},
 		watcherPrefix: "(CLI session, not bound here)",
 		replyChannelTelegram: "via Telegram",
-		replyChannelCli: "via CLI"
+		replyChannelCli: "via CLI",
+		noPending: "No pending permission requests.",
+		listTitle: "Pending permission requests",
+		itemLine(requestId, permission, sessionID) {
+			return [
+				`• ${permission}`,
+				`  Request: ${requestId}`,
+				`  Session: ${sessionID}`
+			].join("\n");
+		}
 	},
 	sessionEvents: {
 		unknownError: "Unknown session error.",
@@ -3123,7 +3140,8 @@ var ZH_CN_BOT_COPY = {
 		cancel: "取消重命名或中止当前请求",
 		model: "查看并切换模型",
 		token: "开启/关闭令牌明细显示",
-		language: "查看并切换语言"
+		language: "查看并切换语言",
+		permissions: "列出待处理的权限请求"
 	},
 	start: { lines: [
 		"# 欢迎使用 opencode-tbot",
@@ -3193,7 +3211,16 @@ var ZH_CN_BOT_COPY = {
 		},
 		watcherPrefix: "（本机 session，非此 chat 绑定）",
 		replyChannelTelegram: "via Telegram 批准",
-		replyChannelCli: "via CLI 批准"
+		replyChannelCli: "via CLI 批准",
+		noPending: "目前没有待处理的权限请求。",
+		listTitle: "待处理的权限请求",
+		itemLine(requestId, permission, sessionID) {
+			return [
+				`• ${permission}`,
+				`  请求：${requestId}`,
+				`  会话：${sessionID}`
+			].join("\n");
+		}
 	},
 	sessionEvents: {
 		unknownError: "未知会话错误。",
@@ -3382,7 +3409,8 @@ var JA_BOT_COPY = {
 		cancel: "名前変更を取り消すか実行中のリクエストを中止",
 		model: "モデルを表示して切り替え",
 		token: "トークン明細の表示を切り替え",
-		language: "言語を表示して切り替え"
+		language: "言語を表示して切り替え",
+		permissions: "保留中の権限リクエストを表示"
 	},
 	start: { lines: [
 		"# opencode-tbot へようこそ",
@@ -3452,7 +3480,16 @@ var JA_BOT_COPY = {
 		},
 		watcherPrefix: "（このチャットに未バインドの CLI セッション）",
 		replyChannelTelegram: "Telegram 経由",
-		replyChannelCli: "CLI 経由"
+		replyChannelCli: "CLI 経由",
+		noPending: "保留中の権限リクエストはありません。",
+		listTitle: "保留中の権限リクエスト",
+		itemLine(requestId, permission, sessionID) {
+			return [
+				`• ${permission}`,
+				`  リクエスト: ${requestId}`,
+				`  セッション: ${sessionID}`
+			].join("\n");
+		}
 	},
 	sessionEvents: {
 		unknownError: "不明なセッションエラーです。",
@@ -3849,6 +3886,8 @@ async function handlePermissionAsked(runtime, request) {
 				chatId,
 				messageId: message.message_id,
 				status: "pending",
+				permission: request.permission,
+				patterns: Array.isArray(request.patterns) ? request.patterns : [],
 				updatedAt: (/* @__PURE__ */ new Date()).toISOString()
 			});
 		} catch (error) {
@@ -5437,6 +5476,57 @@ var TOKEN_COMMAND_DEFINITION = {
 	register: registerTokenCommand
 };
 //#endregion
+//#region src/bot/commands/permissions.ts
+function buildPermissionsListKeyboard(approvals, copy = BOT_COPY) {
+	const rows = approvals.map((approval) => ([
+		{
+			text: copy.permission.allowOnce,
+			callback_data: buildPermissionApprovalCallbackData("once", approval.requestId)
+		},
+		{
+			text: copy.permission.allowAlways,
+			callback_data: buildPermissionApprovalCallbackData("always", approval.requestId)
+		},
+		{
+			text: copy.permission.reject,
+			callback_data: buildPermissionApprovalCallbackData("reject", approval.requestId)
+		}
+	]));
+	return rows.length > 0 ? { inline_keyboard: rows } : undefined;
+}
+async function handlePermissionsCommand(ctx, dependencies) {
+	const chatId = ctx.chat?.id;
+	if (!chatId) return;
+	const copy = await getSafeChatCopy(dependencies.sessionRepo, chatId, dependencies.logger);
+	try {
+		const approvals = (await dependencies.permissionApprovalRepo.listByChatId(chatId, { status: "pending" }))
+			.sort((a, b) => String(a.updatedAt).localeCompare(String(b.updatedAt)));
+		if (approvals.length === 0) {
+			await ctx.reply(copy.permission.noPending);
+			return;
+		}
+		const lines = approvals.map((approval) => copy.permission.itemLine(approval.requestId, approval.permission ?? "?", approval.sessionId ?? "?"));
+		const text = `${copy.permission.listTitle} (${approvals.length})\n\n${lines.join("\n\n")}`;
+		const keyboard = buildPermissionsListKeyboard(approvals, copy);
+		await ctx.reply(text, keyboard ? { reply_markup: keyboard } : void 0);
+	} catch (error) {
+		dependencies.logger.error({ error }, "failed to list pending permission requests");
+		await ctx.reply(presentError(error, copy));
+	}
+}
+function registerPermissionsCommand(bot, dependencies) {
+	bot.command("permissions", async (ctx) => {
+		await handlePermissionsCommand(ctx, scopeDependenciesToTelegramContext(dependencies, ctx, "telegram"));
+	});
+}
+var PERMISSIONS_COMMAND_DEFINITION = {
+	describe(copy) {
+		return copy.commands.permissions;
+	},
+	names: ["permissions"],
+	register: registerPermissionsCommand
+};
+//#endregion
 //#region src/bot/image
 var IMAGE_TOOL_DIR = "/root/image-gen-tools";
 var IMAGE_TOOL_PY = IMAGE_TOOL_DIR + "/.venv/bin/python";
@@ -5527,6 +5617,7 @@ function getTelegramCommandDefinitions() {
 		MODELS_COMMAND_DEFINITION,
 		TOKEN_COMMAND_DEFINITION,
 		LANGUAGE_COMMAND_DEFINITION,
+		PERMISSIONS_COMMAND_DEFINITION,
 		TODO_COMMAND_DEFINITION,
 		TODO_DONE_COMMAND_DEFINITION,
 		SETTODO_COLS_COMMAND_DEFINITION,
