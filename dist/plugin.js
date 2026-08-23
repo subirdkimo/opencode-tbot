@@ -2931,7 +2931,10 @@ var EN_BOT_COPY = {
 				`Request: ${requestId}`,
 				`Reply: ${replyLabel}`
 			].join("\n");
-		}
+		},
+		watcherPrefix: "(CLI session, not bound here)",
+		replyChannelTelegram: "via Telegram",
+		replyChannelCli: "via CLI"
 	},
 	sessionEvents: {
 		unknownError: "Unknown session error.",
@@ -3187,7 +3190,10 @@ var ZH_CN_BOT_COPY = {
 				`请求：${requestId}`,
 				`结果：${replyLabel}`
 			].join("\n");
-		}
+		},
+		watcherPrefix: "（本机 session，非此 chat 绑定）",
+		replyChannelTelegram: "via Telegram 批准",
+		replyChannelCli: "via CLI 批准"
 	},
 	sessionEvents: {
 		unknownError: "未知会话错误。",
@@ -3443,7 +3449,10 @@ var JA_BOT_COPY = {
 				`リクエスト: ${requestId}`,
 				`結果: ${replyLabel}`
 			].join("\n");
-		}
+		},
+		watcherPrefix: "（このチャットに未バインドの CLI セッション）",
+		replyChannelTelegram: "Telegram 経由",
+		replyChannelCli: "CLI 経由"
 	},
 	sessionEvents: {
 		unknownError: "不明なセッションエラーです。",
@@ -3686,14 +3695,53 @@ async function setChatLanguage(sessionRepo, chatId, language) {
 }
 //#endregion
 //#region src/services/permission/telegram-approval.ts
-function buildPermissionApprovalMessage(request, copy = BOT_COPY) {
+var PERMISSION_REPLY_CHANNEL = new Map();
+var NOTIFICATION_WATCHERS_CACHE = { value: null, loadedAt: 0 };
+var NOTIFICATION_WATCHERS_TTL_MS = 5_000;
+function loadNotificationWatchers(pluginConfigFilePath, logger) {
+	const now = Date.now();
+	if (NOTIFICATION_WATCHERS_CACHE.value !== null && now - NOTIFICATION_WATCHERS_CACHE.loadedAt < NOTIFICATION_WATCHERS_TTL_MS) {
+		return NOTIFICATION_WATCHERS_CACHE.value;
+	}
+	let result = [];
+	try {
+		const fs = require("node:fs");
+		if (!pluginConfigFilePath || !fs.existsSync(pluginConfigFilePath)) {
+			result = [];
+		} else {
+			const raw = fs.readFileSync(pluginConfigFilePath, "utf8");
+			const parsed = JSON.parse(raw);
+			const watchers = parsed?.notificationWatchers;
+			if (Array.isArray(watchers)) {
+				result = watchers.filter((item) => typeof item === "string" || typeof item === "number").map((item) => String(item));
+			}
+		}
+	} catch (error) {
+		logger?.warn?.({ error, pluginConfigFilePath }, "failed to read notificationWatchers from config; defaulting to empty");
+		result = [];
+	}
+	NOTIFICATION_WATCHERS_CACHE = { value: result, loadedAt: now };
+	return result;
+}
+function isWatcherChat(watcherList, chatId) {
+	if (!Array.isArray(watcherList) || watcherList.length === 0) return false;
+	return watcherList.some((item) => String(item) === String(chatId));
+}
+function buildPermissionApprovalMessage(request, copy = BOT_COPY, options) {
 	const patternLines = request.patterns.length > 0 ? request.patterns : [copy.permission.noPatterns];
+	const watcherNote = options?.isWatcher && copy.permission.watcherPrefix
+		? [`*${copy.permission.watcherPrefix}*`, ""]
+		: [];
+	const watcherNotePlain = options?.isWatcher && copy.permission.watcherPrefix
+		? [copy.permission.watcherPrefix, ""]
+		: [];
 	const plainText = [
 		copy.permission.requestTitle,
 		"",
 		`${copy.permission.permissionLabel}: ${request.permission}`,
 		`${copy.permission.sessionLabel}: ${request.sessionID}`,
 		"",
+		...watcherNotePlain,
 		`${copy.permission.patternsLabel}:`,
 		...patternLines.map((pattern) => `- ${pattern}`)
 	].join("\n");
@@ -3705,6 +3753,7 @@ function buildPermissionApprovalMessage(request, copy = BOT_COPY) {
 				`${escapeMarkdownV2(copy.permission.permissionLabel)}: ${escapeMarkdownV2(request.permission)}`,
 				`${escapeMarkdownV2(copy.permission.sessionLabel)}: ${escapeMarkdownV2(request.sessionID)}`,
 				"",
+				...watcherNote,
 				`${escapeMarkdownV2(copy.permission.patternsLabel)}:`,
 				...patternLines.map((pattern) => `\\- ${escapeMarkdownV2(pattern)}`)
 			].join("\n"),
@@ -3713,10 +3762,17 @@ function buildPermissionApprovalMessage(request, copy = BOT_COPY) {
 		fallback: { text: plainText }
 	};
 }
-function buildPermissionApprovalResolvedMessage(requestId, reply, copy = BOT_COPY) {
+function buildPermissionApprovalResolvedMessage(requestId, reply, copy = BOT_COPY, origin) {
 	const base = copy.permission.resolved(requestId, copy.permission.replyLabels[reply]);
 	const when = new Date().toISOString().slice(11, 19);
-	return `${base}\n• ${when}Z`;
+	const originLabel = origin === "telegram"
+		? copy.permission.replyChannelTelegram
+		: origin === "cli"
+			? copy.permission.replyChannelCli
+			: null;
+	return originLabel
+		? `${base}\n• ${when}Z\n• ${originLabel}`
+		: `${base}\n• ${when}Z`;
 }
 function buildPermissionApprovalKeyboard(requestId, copy = BOT_COPY) {
 	return { inline_keyboard: [[
@@ -3776,13 +3832,17 @@ async function handlePermissionAsked(runtime, request) {
 		sessionId: request.sessionID
 	});
 	const bindings = await runtime.container.sessionRepo.listBySessionId(request.sessionID);
-	const chatIds = new Set([...bindings.map((binding) => binding.chatId), ...runtime.container.foregroundSessionTracker.listChatIds(request.sessionID)]);
+	const boundChatIds = new Set(bindings.map((binding) => binding.chatId));
+	const foregroundChatIds = new Set(runtime.container.foregroundSessionTracker.listChatIds(request.sessionID));
+	const watcherChatIds = new Set(loadNotificationWatchers(getGlobalPluginConfigFilePath(), logger));
+	const chatIds = new Set([...boundChatIds, ...foregroundChatIds, ...watcherChatIds]);
 	const approvals = await runtime.container.permissionApprovalRepo.listByRequestId(request.id);
 	const approvedChatIds = new Set(approvals.map((approval) => approval.chatId));
 	for (const chatId of chatIds) {
 		if (approvedChatIds.has(chatId)) continue;
+		const isWatcher = !boundChatIds.has(chatId) && !foregroundChatIds.has(chatId) && isWatcherChat([...watcherChatIds], chatId);
 		try {
-			const message = await sendPermissionApprovalMessage(runtime, chatId, request, await getSafeChatCopy(runtime.container.sessionRepo, chatId, logger), logger);
+			const message = await sendPermissionApprovalMessage(runtime, chatId, request, await getSafeChatCopy(runtime.container.sessionRepo, chatId, logger), logger, { isWatcher });
 			await runtime.container.permissionApprovalRepo.set({
 				requestId: request.id,
 				sessionId: request.sessionID,
@@ -3808,11 +3868,13 @@ async function handlePermissionReplied(runtime, event) {
 		requestId: event.requestId,
 		sessionId: event.sessionId
 	});
+	const origin = PERMISSION_REPLY_CHANNEL.get(event.requestId) ?? "cli";
+	PERMISSION_REPLY_CHANNEL.delete(event.requestId);
 	const approvals = await runtime.container.permissionApprovalRepo.listByRequestId(event.requestId);
 	await Promise.all(approvals.map(async (approval) => {
 		try {
 			const copy = await getSafeChatCopy(runtime.container.sessionRepo, approval.chatId, logger);
-			await runtime.bot.api.editMessageText(approval.chatId, approval.messageId, buildPermissionApprovalResolvedMessage(event.requestId, event.reply, copy));
+			await runtime.bot.api.editMessageText(approval.chatId, approval.messageId, buildPermissionApprovalResolvedMessage(event.requestId, event.reply, copy, origin));
 		} catch (error) {
 			const isNotModified = error?.error_code === 400 && /message is not modified/i.test(error?.description ?? error?.message ?? "");
 			if (isNotModified) {
@@ -3872,8 +3934,8 @@ async function notifyBoundChats(runtime, sessionId, getText) {
 		}
 	}));
 }
-async function sendPermissionApprovalMessage(runtime, chatId, request, copy, logger) {
-	const message = buildPermissionApprovalMessage(request, copy);
+async function sendPermissionApprovalMessage(runtime, chatId, request, copy, logger, options) {
+	const message = buildPermissionApprovalMessage(request, copy, options);
 	const replyMarkup = buildPermissionApprovalKeyboard(request.id, copy);
 	try {
 		return await runtime.bot.api.sendMessage(chatId, message.preferred.text, {
@@ -5770,7 +5832,9 @@ async function handlePermissionApprovalCallback(ctx, dependencies) {
 			await ctx.editMessageText(copy.permission.replyFailed);
 			return;
 		}
+		PERMISSION_REPLY_CHANNEL.set(parsed.requestId, "telegram");
 		if (!await dependencies.opencodeClient.replyToPermission(approval.sessionId, parsed.requestId, parsed.reply)) {
+			PERMISSION_REPLY_CHANNEL.delete(parsed.requestId);
 			await ctx.editMessageText(copy.permission.replyFailed);
 			return;
 		}
@@ -5779,7 +5843,7 @@ async function handlePermissionApprovalCallback(ctx, dependencies) {
 			status: parsed.reply,
 			updatedAt: (/* @__PURE__ */ new Date()).toISOString()
 		});
-		await ctx.editMessageText(buildPermissionApprovalResolvedMessage(parsed.requestId, parsed.reply, copy));
+		await ctx.editMessageText(buildPermissionApprovalResolvedMessage(parsed.requestId, parsed.reply, copy, "telegram"));
 	} catch (error) {
 		const isNotModified = error?.error_code === 400 && /message is not modified/i.test(error?.description ?? error?.message ?? "");
 		if (isNotModified) {
