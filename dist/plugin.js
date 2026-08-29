@@ -3918,12 +3918,12 @@ async function handlePermissionAsked(runtime, request) {
 		sessionId: request.sessionID
 	});
 	const bindings = await runtime.container.sessionRepo.listBySessionId(request.sessionID);
-	const boundChatIds = new Set(bindings.map((binding) => binding.chatId));
-	const foregroundChatIds = new Set(runtime.container.foregroundSessionTracker.listChatIds(request.sessionID));
-	const watcherChatIds = new Set(loadNotificationWatchers(getGlobalPluginConfigFilePath(), logger));
+	const boundChatIds = new Set(bindings.map((binding) => String(binding.chatId)));
+	const foregroundChatIds = new Set(runtime.container.foregroundSessionTracker.listChatIds(request.sessionID).map((id) => String(id)));
+	const watcherChatIds = new Set(loadNotificationWatchers(getGlobalPluginConfigFilePath(), logger).map((id) => String(id)));
 	const chatIds = new Set([...boundChatIds, ...foregroundChatIds, ...watcherChatIds]);
 	const approvals = await runtime.container.permissionApprovalRepo.listByRequestId(request.id);
-	const approvedChatIds = new Set(approvals.map((approval) => approval.chatId));
+	const approvedChatIds = new Set(approvals.map((approval) => String(approval.chatId)));
 	for (const chatId of chatIds) {
 		if (approvedChatIds.has(chatId)) continue;
 		const isWatcher = !boundChatIds.has(chatId) && !foregroundChatIds.has(chatId) && isWatcherChat([...watcherChatIds], chatId);
@@ -5979,7 +5979,7 @@ async function handlePermissionApprovalCallback(ctx, dependencies) {
 	if (!parsed) return;
 	const copy = await getSafeChatCopy(dependencies.sessionRepo, ctx.chat.id, dependencies.logger);
 	try {
-		let approval = (await dependencies.permissionApprovalRepo.listByRequestId(parsed.requestId)).find((item) => item.chatId === ctx.chat?.id);
+		let approval = (await dependencies.permissionApprovalRepo.listByRequestId(parsed.requestId)).find((item) => String(item.chatId) === String(ctx.chat?.id));
 		if (!approval) {
 			// Already resolved, expired, or cleaned up — treat as a no-op.
 			await ctx.editMessageText(copy.permission.replyHandled);
