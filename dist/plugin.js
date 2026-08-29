@@ -5682,7 +5682,9 @@ function getTelegramCommandDefinitions() {
 		TODO_COMMAND_DEFINITION,
 		TODO_DONE_COMMAND_DEFINITION,
 		SETTODO_COLS_COMMAND_DEFINITION,
-		IMAGE_COMMAND_DEFINITION
+		IMAGE_COMMAND_DEFINITION,
+		MAILSEARCH_COMMAND_DEFINITION,
+		PMMTF_MENU_COMMAND_DEFINITION
 	];
 }
 function registerTelegramCommands(bot, dependencies) {
@@ -6155,7 +6157,8 @@ var CALLBACK_ROUTE_REGISTRARS = [
 	registerTokenCallbackRoute,
 	registerLanguageCallbackRoute,
 	registerPermissionApprovalCallbackRoute,
-	registerTodoCallbackRoute
+	registerTodoCallbackRoute,
+	registerPmmtfMenuRoute
 ];
 function registerCallbackHandler(bot, dependencies) {
 	for (const registerRoute of CALLBACK_ROUTE_REGISTRARS) registerRoute(bot, dependencies);
@@ -6350,6 +6353,132 @@ function createLoggingMiddleware(logger) {
 	};
 }
 //#endregion
+//#region [opencode-tbot:pmmtf-menu] START
+var PMMTF_MENU_SCRIPT = "/root/.config/opencode/mail-agent/pmmtf_menu.py";
+var PMMTF_MENU_SAFE = { status: 1, list: 1, view: 1, log: 1, state: 1, help: 1, run: 1 };
+var PMMTF_MENU_TIMEOUT_MS = 60000;
+var PMMTF_MENU_PENDING = /* @__PURE__ */ new Map();
+var PMMTF_MENU_CALLBACK_PREFIX = "pmmtf:";
+async function runPmmtfMenu(args) {
+	const { spawnSync } = await import("node:child_process");
+	const cmdArgs = ["python3", PMMTF_MENU_SCRIPT];
+	for (const piece of args) if (piece) cmdArgs.push(piece);
+	const result = spawnSync(cmdArgs[0], cmdArgs.slice(1), { encoding: "utf-8", timeout: PMMTF_MENU_TIMEOUT_MS });
+	if (result.error) {
+		if (result.error.code === "ETIMEDOUT") return { error: "執行逾時（>60s）" };
+		return { error: result.error.message };
+	}
+	const output = (result.stdout || "").trim();
+	const stderr = (result.stderr || "").trim();
+	const rc = result.status ?? -1;
+	const detail = stderr.trimStart();
+	return {
+		ok: rc === 0,
+		text: output || (detail ? `rc=${rc}\n${detail}` : `（沒有輸出，rc=${rc}）`)
+	};
+}
+async function pmmtfMenuPreview(ctx, dependencies, tokens) {
+	const copy = await getSafeChatCopy(dependencies.sessionRepo, ctx.chat.id, dependencies.logger);
+	const preview = await runPmmtfMenu(tokens);
+	if (preview.error) {
+		await ctx.reply(presentError(new Error(preview.error), copy));
+		return;
+	}
+	PMMTF_MENU_PENDING.set(ctx.chat.id, tokens);
+	const keyboard = {
+		inline_keyboard: [[
+			{ text: "✅ 執行", callback_data: "pmmtf:exec" },
+			{ text: "❌ 取消", callback_data: "pmmtf:cancel" }
+		]]
+	};
+	let body = "⚠️ 這是「變更/寄發」動作 — 上面是 dry-run 預覽，按「✅ 執行」才真正寄發：\n\n" + preview.text;
+	if (body.length > 4000) body = body.slice(0, 4000 - 200) + "\n…（截斷，回 view <code> 看全稿）";
+	await ctx.reply(body, { reply_markup: keyboard });
+}
+async function handlePmmtfMenuCommand(ctx, dependencies) {
+	const copy = await getSafeChatCopy(dependencies.sessionRepo, ctx.chat.id, dependencies.logger);
+	const args = (ctx.match ?? "").trim();
+	const tokens = args ? args.split(/\s+/) : [];
+	if (tokens.length === 0) {
+		const r = await runPmmtfMenu(["status"]);
+		if (r.error) await ctx.reply(presentError(new Error(r.error), copy));
+		else await ctx.reply("📋 PM/MTF 審核選單\n\n" + r.text);
+		return;
+	}
+	const cmd = tokens[0].toLowerCase();
+	if (PMMTF_MENU_SAFE[cmd]) {
+		const r = await runPmmtfMenu(tokens);
+		if (r.error) await ctx.reply(presentError(new Error(r.error), copy));
+		else await ctx.reply(r.text);
+		return;
+	}
+	if (cmd === "help") {
+		const r = await runPmmtfMenu(["help"]);
+		if (r.error) await ctx.reply(presentError(new Error(r.error), copy));
+		else await ctx.reply(r.text);
+		return;
+	}
+	if (cmd === "run" && tokens.length > 1) {
+		const r = await runPmmtfMenu(tokens);
+		if (r.error) await ctx.reply(presentError(new Error(r.error), copy));
+		else await ctx.reply(`${tokens[0]} ${tokens[1]}\n\n${r.text}`);
+		return;
+	}
+	await pmmtfMenuPreview(ctx, dependencies, tokens);
+}
+function registerPmmtfMenuCommand(bot, dependencies) {
+	bot.command(["pmmtf", "pmmtf-menu", "pmmtf_menu"], async (ctx) => {
+		await handlePmmtfMenuCommand(ctx, scopeDependenciesToTelegramContext(dependencies, ctx, "telegram"));
+	});
+}
+async function handlePmmtfMenuCallback(ctx, dependencies) {
+	const data = ctx.callbackQuery.data;
+	if (!data.startsWith(PMMTF_MENU_CALLBACK_PREFIX)) return;
+	await ctx.answerCallbackQuery();
+	if (!ctx.chat) return;
+	const copy = await getSafeChatCopy(dependencies.sessionRepo, ctx.chat.id, dependencies.logger);
+	const action = data.slice(PMMTF_MENU_CALLBACK_PREFIX.length).split(":")[0] || "";
+	try {
+		if (action === "cancel") {
+			PMMTF_MENU_PENDING.delete(ctx.chat.id);
+			await ctx.editMessageText("❌ 已取消（draft 仍 pending）");
+			return;
+		}
+		if (action === "exec") {
+			const tokens = PMMTF_MENU_PENDING.get(ctx.chat.id);
+			if (!tokens) {
+				await ctx.editMessageText("❌ 沒有待執行的動作（已過期或被取消）");
+				return;
+			}
+			await ctx.editMessageText("⏳ 執行中…");
+			const r = await runPmmtfMenu([...tokens, "--yes"]);
+			PMMTF_MENU_PENDING.delete(ctx.chat.id);
+			if (r.error) {
+				await ctx.reply(presentError(new Error(r.error), copy));
+				return;
+			}
+			await ctx.editMessageText((r.ok ? "✅ 已執行\n\n" : "⚠️ 執行有 warning（rc≠0）\n\n") + r.text);
+			return;
+		}
+		await ctx.editMessageText("❌ 未知動作");
+	} catch (error) {
+		dependencies.logger.error({ error }, "failed to handle pmmtf-menu callback");
+		await ctx.editMessageText(presentError(error, copy));
+	}
+}
+function registerPmmtfMenuRoute(bot, dependencies) {
+	bot.callbackQuery(/^pmmtf:/, async (ctx) => {
+		await handlePmmtfMenuCallback(ctx, scopeDependenciesToTelegramContext(dependencies, ctx, "telegram"));
+	});
+}
+var PMMTF_MENU_COMMAND_DEFINITION = {
+	describe() {
+		return "PM/MTF 審核選單（預設 status；edit/remove/withdraw/replace 走 dry-run→inline ✅；send/digest/mail 需 ✅ 才真寄；help 看對照表）";
+	},
+	names: ["pmmtf"],
+	register: registerPmmtfMenuCommand
+};
+//#endregion [opencode-tbot:pmmtf-menu] END
 //#region src/bot/index.ts
 function registerBot(bot, container, options) {
 	bot.use(createLoggingMiddleware(container.logger));
