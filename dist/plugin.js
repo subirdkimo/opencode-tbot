@@ -542,17 +542,13 @@ var FilePermissionApprovalRepository = class {
 		});
 	}
 	async cleanupExpired() {
-		const state = await this.store.read();
-		let changed = false;
-		for (const key of Object.keys(state.pendingPermissions)) {
-			if (isExpired(state.pendingPermissions[key])) {
-				delete state.pendingPermissions[key];
-				changed = true;
+		await this.store.update((state) => {
+			for (const key of Object.keys(state.pendingPermissions)) {
+				if (isExpired(state.pendingPermissions[key])) {
+					delete state.pendingPermissions[key];
+				}
 			}
-		}
-		if (changed) {
-			await this.store.write(state);
-		}
+		});
 	}
 };
 //#endregion
@@ -904,7 +900,7 @@ var OpenCodeClient = class {
 			});
 			return { success: true };
 		} catch (error) {
-			const message = String(error?.message ?? error ?? "").toLowerCase();
+			const message = String(error?.message ?? error?.data?.message ?? error ?? "").toLowerCase();
 			if (message.includes("already") || message.includes("resolved") || message.includes("completed")) {
 				return { success: false, reason: "already_resolved", error };
 			}
@@ -914,7 +910,14 @@ var OpenCodeClient = class {
 			if (message.includes("session") && (message.includes("closed") || message.includes("ended") || message.includes("not found"))) {
 				return { success: false, reason: "session_closed", error };
 			}
-			return { success: false, reason: "network", error };
+			// Real transport-level failures (no response from the server).
+			const isNetwork = /\b(fetch failed|fetch error|timeout|timed out|econn|enotfound|eai_again|socket hang up|network)\b/.test(message);
+			if (isNetwork) {
+				return { success: false, reason: "network", error };
+			}
+			// A 4xx/500 response from the permission endpoint means the request is
+			// no longer pending (already answered elsewhere, cancelled, or gone).
+			return { success: false, reason: "already_resolved", error };
 		}
 	}
 	async listModels() {
@@ -2970,6 +2973,7 @@ var EN_BOT_COPY = {
 		allowAlways: "Always allow",
 		reject: "Reject",
 		replyFailed: "Failed to reply to the permission request.",
+		replyHandled: "This permission request was already handled.",
 		replyLabels: {
 			once: "allow once",
 			always: "always allow",
@@ -3239,6 +3243,7 @@ var ZH_CN_BOT_COPY = {
 		allowAlways: "始终允许",
 		reject: "拒绝",
 		replyFailed: "回复权限请求失败。",
+		replyHandled: "此权限请求已被处理。",
 		replyLabels: {
 			once: "本次允许",
 			always: "始终允许",
@@ -3508,6 +3513,7 @@ var JA_BOT_COPY = {
 		allowAlways: "常に許可",
 		reject: "拒否",
 		replyFailed: "権限リクエストへの応答に失敗しました。",
+		replyHandled: "この権限リクエストはすでに処理されています。",
 		replyLabels: {
 			once: "今回のみ許可",
 			always: "常に許可",
@@ -5973,9 +5979,10 @@ async function handlePermissionApprovalCallback(ctx, dependencies) {
 	if (!parsed) return;
 	const copy = await getSafeChatCopy(dependencies.sessionRepo, ctx.chat.id, dependencies.logger);
 	try {
-		const approval = (await dependencies.permissionApprovalRepo.listByRequestId(parsed.requestId)).find((item) => item.chatId === ctx.chat?.id);
+		let approval = (await dependencies.permissionApprovalRepo.listByRequestId(parsed.requestId)).find((item) => item.chatId === ctx.chat?.id);
 		if (!approval) {
-			await ctx.editMessageText(copy.permission.replyFailed);
+			// Already resolved, expired, or cleaned up — treat as a no-op.
+			await ctx.editMessageText(copy.permission.replyHandled);
 			return;
 		}
 		if (approval.expiresAt && Date.now() > approval.expiresAt) {
@@ -5986,23 +5993,25 @@ async function handlePermissionApprovalCallback(ctx, dependencies) {
 		const replyResult = await dependencies.opencodeClient.replyToPermission(approval.sessionId, parsed.requestId, parsed.reply);
 		if (!replyResult.success) {
 			PERMISSION_REPLY_CHANNEL.delete(parsed.requestId);
-			let errorText = copy.permission.replyFailed;
 			switch (replyResult.reason) {
 				case "already_resolved":
-					errorText = "✅ Already handled by another user";
-					break;
 				case "not_found":
-					errorText = "❌ Permission request not found (may have been cancelled)";
-					break;
 				case "session_closed":
-					errorText = "❌ Session no longer active";
-					break;
+					// No longer pending server-side: mark local approval resolved (idempotent).
+					await dependencies.permissionApprovalRepo.set({
+						...approval,
+						status: parsed.reply,
+						updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+					});
+					await ctx.editMessageText(copy.permission.replyHandled);
+					return;
 				case "network":
-					errorText = "⚠️ Failed to reach opencode — try again";
-					break;
+					await ctx.editMessageText("⚠️ Failed to reach opencode — your tap wasn't registered, please try again");
+					return;
+				default:
+					await ctx.editMessageText(copy.permission.replyFailed);
+					return;
 			}
-			await ctx.editMessageText(errorText);
-			return;
 		}
 		await dependencies.permissionApprovalRepo.set({
 			...approval,
