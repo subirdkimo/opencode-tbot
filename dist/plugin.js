@@ -5682,6 +5682,7 @@ function getTelegramCommandDefinitions() {
 		TODO_COMMAND_DEFINITION,
 		TODO_DONE_COMMAND_DEFINITION,
 		SETTODO_COLS_COMMAND_DEFINITION,
+		RULES_COMMAND_DEFINITION,
 		IMAGE_COMMAND_DEFINITION,
 		MAILSEARCH_COMMAND_DEFINITION,
 		PMMTF_MENU_COMMAND_DEFINITION
@@ -7115,6 +7116,43 @@ var SETTODO_COLS_COMMAND_DEFINITION = {
 	},
 	names: ["settodo_cols"],
 	register: registerSetTodoColsCommand
+};
+async function handleRulesCommand(ctx, dependencies) {
+	const copy = await getSafeChatCopy(dependencies.sessionRepo, ctx.chat.id, dependencies.logger);
+	const args = String(ctx.match ?? "").trim();
+	try {
+		const { execFile } = require("node:child_process");
+		const py = process.env.PMMTF_PYTHON || "python3";
+		const code = ["status"];
+		if (args) code.push(...args.split(/\s+/));
+		const out = await new Promise((resolve, reject) => {
+			execFile(py, ["/root/.config/opencode/mail-agent/pmmtf_menu.py", "--rules", ...code], { timeout: 30000 }, (err, stdout, stderr) => {
+				if (err && err.code === "ENOENT") {
+					resolve("⚠️ pmmtf_menu.py 不存在；請確認 ai-rules 引擎已部署。");
+				} else if (err) {
+					resolve(`⚠️ 規則引擎錯誤：${stderr || err.message}`);
+				} else {
+					resolve(stdout.trim() || "(無輸出)");
+				}
+			});
+		});
+		await ctx.reply(`📋 ai-rules 引擎\n\n${out}`);
+	} catch (error) {
+		dependencies.logger.error({ error }, "failed to run /rules");
+		await ctx.reply(presentError(error, copy));
+	}
+}
+function registerRulesCommand(bot, dependencies) {
+	bot.command("rules", async (ctx) => {
+		await handleRulesCommand(ctx, scopeDependenciesToTelegramContext(dependencies, ctx, "telegram"));
+	});
+}
+var RULES_COMMAND_DEFINITION = {
+	describe() {
+		return "ai-rules 引擎控制面板（status|reload|disable <id>|enable <id>|test <from> <subject>；無參數顯示總覽）";
+	},
+	names: ["rules"],
+	register: registerRulesCommand
 };
 async function safeEditMessageText(ctx, text, options) {
 	try {
